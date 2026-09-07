@@ -638,6 +638,7 @@ class SarvamMLAForCausalLM(
         defaults = {
             "n_group": 1,
             "topk_group": 1,
+            "router_dtype": "fp32",
         }
         for attr, default in defaults.items():
             if getattr(config, attr, None) is None:

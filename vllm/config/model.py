@@ -2442,7 +2442,11 @@ def _get_and_verify_max_len(
 
     # NOTE(woosuk): Gemma3's max_model_len (128K) is already scaled by RoPE
     # scaling, so we skip applying the scaling factor again.
-    if rope_parameters is not None and "gemma3" not in hf_config.model_type:
+    if (
+        rope_parameters is not None
+        and "gemma3" not in hf_config.model_type
+        and hf_config.model_type != "sarvam_mla"
+    ):
         scaling_factor = 1.0
         for rp in rope_parameters.values():
             # No need to consider "type" key because of patch_rope_parameters when
