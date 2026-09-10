@@ -64,10 +64,3 @@ Never re-enable inherited workflows: exact mirrors contain their original YAML.
 Review conflicts, preserve Sarvam sync files, and keep upstream workflows disabled.
 Record model correctness and serving-performance validation in each release PR.
 Merge with a merge commit to retain upstream ancestry.
-
-## Tests
-
-Run `python3 .github/sarvam/test_sync_releases.py` in a virtual environment.
-The offline tests use mocked GitHub responses and real temporary Git repositories
-for release selection, annotated tags, workflow preflight, dry runs, immutable
-mirrors, divergent history, duplicate PRs and already-integrated releases.
