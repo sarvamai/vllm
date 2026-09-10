@@ -171,13 +171,6 @@ def sync(repo, dry_run):
                 )
             if branch not in mirrors:
                 plans[branch] = sha
-        latest = max(releases, key=version)
-        latest_sha = shas[latest["tag_name"]]
-        rolling = f"{prefix}/main"
-        if mirrors.get(rolling) != latest_sha:
-            if rolling in mirrors and not ancestor(mirrors[rolling], latest_sha):
-                raise RuntimeError(f"Refusing non-fast-forward update of {rolling}")
-            plans[rolling] = latest_sha
         paths = set()
         for sha in set(shas.values()):
             paths.update(

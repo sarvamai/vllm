@@ -3,7 +3,6 @@
 Every six hours, the opt-in workflow checks stable releases of `vllm-project/vllm`.
 It mirrors exact upstream commits and opens draft PRs into Sarvam `main`.
 
-- `vllm/main` tracks the newest stable version seen, using fast-forward updates.
 - `vllm/release-vX.Y.Z` records an immutable release and is its PR's source.
 - Tags `vX.Y.Z` and `vX.Y.Z.postN` qualify; drafts, prereleases and component
   releases are excluded. Bootstrap starts at the newest stable version. Later
@@ -11,8 +10,9 @@ It mirrors exact upstream commits and opens draft PRs into Sarvam `main`.
   releases and multiple releases between polls.
 - Already-integrated releases need no PR; existing open PRs are reused. Closing an
   unmerged PR causes it to be proposed again. Release branches must be retained.
-- Moved tags, missing release metadata or divergent history stop synchronization.
+- Moved tags or missing release metadata stop synchronization.
   Ref updates are atomic and verified. No force pushes or automatic merges occur.
+  Each release has its own branch because successive upstream tags can diverge.
 
 ## Setup
 
@@ -56,8 +56,8 @@ registered and **`disabled_manually`**; inactivity/fork-disabled states do not c
 The script never checks out or executes upstream code.
 
 A new workflow filename stops the sync before any push. Register it using an inert
-workflow on a temporary branch (only `workflow_dispatch` and a job with `if: false`),
-verify and disable its registered ID, then retry. Do not register the original
+workflow on a temporary branch (`push` restricted to that branch and a job with
+`if: false`), verify and disable its registered ID, then retry. Do not register the original
 executable workflow as a workaround. Remove the temporary branch afterwards.
 Never re-enable inherited workflows: exact mirrors contain their original YAML.
 
