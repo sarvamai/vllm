@@ -21,8 +21,7 @@ jobs:
   sync:
     if: >-
       github.repository == 'sarvamai/vllm' &&
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'workflow_dispatch' || vars.SARVAM_RELEASE_SYNC_ENABLED == 'true')
+      github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

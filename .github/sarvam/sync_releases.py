@@ -27,8 +27,9 @@ def api(endpoint, method="GET"):
 
 def pages(endpoint, key=None):
     result = []
+    separator = "&" if "?" in endpoint else "?"
     for page in range(1, 1001):
-        batch = api(f"{endpoint}?per_page=100&page={page}")
+        batch = api(f"{endpoint}{separator}per_page=100&page={page}")
         batch = batch[key] if key else batch
         result.extend(batch)
         if len(batch) < 100:
@@ -124,7 +125,7 @@ def sync(repo, dry_run):
     workflows = pages(f"repos/{repo}/actions/workflows", "workflows")
     if not any(w["path"] == WORKFLOW and w["state"] == "active" for w in workflows):
         raise RuntimeError("Sarvam sync workflow must be registered and active")
-    open_prs = pages(f"repos/{repo}/pulls")
+    pull_requests = pages(f"repos/{repo}/pulls?state=all")
     with tempfile.TemporaryDirectory(prefix="sarvam-release-sync-") as directory:
 
         def git(*args):
@@ -214,10 +215,12 @@ def sync(repo, dry_run):
             if any(
                 pr["base"]["ref"] == "main"
                 and pr["head"]["ref"] == branch
+                and pr["head"]["sha"] == sha
                 and (pr["head"].get("repo") or {}).get("full_name") == repo
-                for pr in open_prs
+                and (pr["state"] == "open" or pr["merged_at"] is not None)
+                for pr in pull_requests
             ):
-                print(f"PR already open: {branch}")
+                print(f"Release PR already open or merged: {branch}")
                 continue
             print(f"Draft PR: {branch} -> main")
             if dry_run:
@@ -229,7 +232,7 @@ def sync(repo, dry_run):
                 f"- Published: {release['published_at']}\n"
                 f"- Exact upstream commit: `{sha}`\n\n"
                 "The release branch is immutable. Preserve Sarvam sync files and keep "
-                "upstream workflows disabled. Use a merge commit to retain ancestry. "
+                "upstream workflows disabled. "
                 "No model validation has run automatically; record correctness and "
                 "serving-performance results before merging.\n"
             )
