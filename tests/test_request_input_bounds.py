@@ -196,10 +196,10 @@ REQUEST_BUILDERS: list[Callable[[list[str]], _StopRequest]] = [
 
 
 @pytest.mark.parametrize("build_request", REQUEST_BUILDERS)
-def test_public_requests_accept_four_stop_strings(
+def test_public_requests_accept_max_stop_strings(
     build_request: Callable[[list[str]], _StopRequest],
 ):
-    stop = ["one", "two", "three", "four"]
+    stop = [f"stop{i}" for i in range(envs.VLLM_MAX_STOP_STRINGS)]
 
     request = build_request(stop)
 
@@ -207,11 +207,12 @@ def test_public_requests_accept_four_stop_strings(
 
 
 @pytest.mark.parametrize("build_request", REQUEST_BUILDERS)
-def test_public_requests_reject_more_than_four_stop_strings(
+def test_public_requests_reject_more_than_max_stop_strings(
     build_request: Callable[[list[str]], _StopRequest],
 ):
-    with pytest.raises(ValidationError, match="at most 4"):
-        build_request(["one", "two", "three", "four", "five"])
+    limit = envs.VLLM_MAX_STOP_STRINGS
+    with pytest.raises(ValidationError, match=f"at most {limit}"):
+        build_request([f"stop{i}" for i in range(limit + 1)])
 
 
 def test_stop_string_limit_can_be_overridden():
