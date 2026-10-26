@@ -1271,7 +1271,12 @@ def test_swap_blocks_mla(
         )
 
 
-@pytest.mark.parametrize("kv_lora_rank", [512])
+# 512 (+64 rope = 576) is the DeepSeek-style width with its own
+# compile-time-constant-divisor CUDA kernel instantiation; 96/224/352
+# (+64 rope = 160/288/416) exercise the runtime-ENTRY_SIZE fallback added
+# for non-DeepSeek MLA cache widths (e.g. kv_lora_rank + qk_rope_head_dim
+# combinations outside {320, 512, 576}).
+@pytest.mark.parametrize("kv_lora_rank", [512, 96, 224, 352])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.parametrize("num_blocks", [1024])
@@ -1382,7 +1387,7 @@ def test_gather_and_maybe_dequant_cache_mla(
     torch.testing.assert_close(dst, expected)
 
 
-@pytest.mark.parametrize("kv_lora_rank", [512])
+@pytest.mark.parametrize("kv_lora_rank", [512, 96, 224, 352])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.parametrize("num_blocks", [128])
@@ -1450,6 +1455,74 @@ def test_gather_and_maybe_dequant_cache_mla_with_seq_starts(
         kv_cache_dtype,
         scale,
         seq_starts,
+    )
+    torch.testing.assert_close(dst, expected)
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_gather_and_maybe_dequant_cache_mla_nonvectorizable_width(
+    kv_cache_dtype,
+    device,
+):
+    """entry_size=161 is not a multiple of the float4-width vector (4 or 8
+    elements, depending on dtype), so this exercises the scalar element-wise
+    fallback in gather_and_maybe_dequant_cache_page_generic rather than its
+    vectorized load/store path."""
+    kv_lora_rank, qk_rope_head_dim = 97, 64
+    entry_size = kv_lora_rank + qk_rope_head_dim
+    assert entry_size % 4 != 0
+
+    block_size, num_blocks, dtype = 16, 64, torch.float32
+    scale = torch.tensor(0.1, dtype=torch.float32, device=device)
+    src_cache = _create_mla_cache(
+        num_blocks, block_size, entry_size, dtype, kv_cache_dtype, device
+    )
+    _fill_mla_cache(src_cache, kv_cache_dtype=kv_cache_dtype)
+
+    seq_lens = torch.tensor([20, 10, 16], dtype=torch.int32, device=device)
+    batch_size = seq_lens.shape[0]
+    total_tokens = int(seq_lens.sum().item())
+    cu_seq_lens = torch.empty((batch_size + 1), dtype=torch.int32, device=device)
+    cu_seq_lens[0] = 0
+    cu_seq_lens[1:] = seq_lens.cumsum(dim=0)
+    token_to_seq = torch.repeat_interleave(
+        torch.arange(batch_size, dtype=torch.int32, device=device), seq_lens
+    )
+
+    block_table = torch.empty(
+        (batch_size, num_blocks), dtype=torch.int32, device=device
+    )
+    for b in range(batch_size):
+        block_table[b, :] = torch.randperm(num_blocks, device=device)
+
+    if kv_cache_dtype == "fp8":
+        dequant_src_cache = torch.empty_like(src_cache, dtype=dtype)
+        ops.convert_fp8(dequant_src_cache, src_cache, scale.item())
+    else:
+        dequant_src_cache = src_cache
+
+    expected_rows = []
+    for b in range(batch_size):
+        length = int(seq_lens[b].item())
+        for offset in range(length):
+            block_id = block_table[b, offset // block_size]
+            slot = offset % block_size
+            expected_rows.append(dequant_src_cache[block_id, slot])
+    expected = torch.stack(expected_rows)
+
+    dst = torch.zeros((total_tokens, entry_size), dtype=dtype, device=device)
+    ops.gather_and_maybe_dequant_cache(
+        src_cache,
+        dst,
+        block_table,
+        cu_seq_lens,
+        token_to_seq,
+        total_tokens,
+        kv_cache_dtype,
+        scale,
+        None,
     )
     torch.testing.assert_close(dst, expected)
 

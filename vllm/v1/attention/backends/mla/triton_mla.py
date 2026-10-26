@@ -48,7 +48,29 @@ def _compute_num_kv_splits(max_seq_len: int, sm_count: int) -> int:
     return min(ideal_splits, max_splits)
 
 
-class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
+class TritonMLAMetadata(MLACommonMetadata):
+    """MLACommonMetadata.__post_init__ validates head_dim against
+    MLACommonBackend's fixed [320, 512, 576] allowlist regardless of which
+    concrete backend built the metadata, so it rejects every other
+    kv_lora_rank + qk_rope_head_dim width even though TritonMLABackend
+    advertises no head-size restriction (get_supported_head_sizes() == []:
+    decode_attention_fwd and forward_mqa index purely off tensor strides,
+    with no kernel specialized to a fixed width). This override replaces
+    that check with the Triton backend's actual contract: any positive
+    width. The inherited dataclass constructor dispatches to
+    self.__post_init__, so this override alone (without re-decorating with
+    @dataclass) is enough to change validation for metadata built through
+    TritonMLAMetadataBuilder.
+    """
+
+    def __post_init__(self):
+        if self.head_dim is not None and self.head_dim <= 0:
+            raise ValueError(
+                f"Head dimension {self.head_dim} must be positive for Triton MLA."
+            )
+
+
+class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[TritonMLAMetadata]):
     # forward_mqa flattens a uniform multi-token block to one decode row per
     # query token, so causal and non-causal blocks both take the decode path.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
@@ -56,7 +78,13 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
-        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        super().__init__(
+            kv_cache_spec,
+            layer_names,
+            vllm_config,
+            device,
+            metadata_cls=TritonMLAMetadata,
+        )
         # DCP local sequence lengths are not advanced between draft steps.
         self.supports_draft_decode_metadata_update = self.dcp_world_size == 1
         self._reserve_attn_logits_workspace()

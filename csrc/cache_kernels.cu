@@ -1320,6 +1320,109 @@ __global__ void gather_and_maybe_dequant_cache_page(
   }
 }
 
+// Same gather/dequant as gather_and_maybe_dequant_cache_page, but with
+// ENTRY_SIZE taken as a runtime argument instead of a template parameter.
+// The three sizes used by DeepSeek-style MLA (320/512/576) get the
+// compile-time-constant-divisor template above, which lets the compiler
+// strength-reduce `flat_idx / vec_iter_cnt` into a multiply; every other
+// kv_lora_rank + qk_rope_head_dim width (e.g. non-DeepSeek MLA exports)
+// lands here instead, with a plain runtime integer division. Still
+// vectorizes on the float4-width load/store when entry_size allows it, and
+// falls back to an element-wise copy when it does not (arbitrary widths,
+// not just multiples of the vector width, remain correct).
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+__global__ void gather_and_maybe_dequant_cache_page_generic(
+    const cache_t* __restrict__ src_cache, scalar_t* __restrict__ dst,
+    const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ cu_seq_lens, const int32_t num_reqs,
+    const int32_t num_tokens, const int32_t block_size,
+    const int64_t block_table_stride, const int64_t cache_block_stride,
+    const int64_t cache_entry_stride, const int64_t dst_entry_stride,
+    const float* __restrict__ scale, const int32_t* __restrict__ seq_starts,
+    const int32_t entry_size) {
+  constexpr int32_t vec_size = sizeof(float4) / sizeof(scalar_t);
+  const int32_t vec_iter_cnt = entry_size / vec_size;
+  const bool vectorizable = (entry_size % vec_size) == 0;
+  using ltype = vllm::vec_n_t<cache_t, vec_size>;
+  using stype = vllm::vec_n_t<scalar_t, vec_size>;
+
+  __shared__ GatherPageTask page;
+  __shared__ int32_t physical_block;
+  __shared__ bool has_task;
+  __shared__ bool copy_task;
+  __shared__ float scale_value;
+
+  if (threadIdx.x == 0) {
+    if constexpr (kv_dt != Fp8KVCacheDataType::kAuto) {
+      scale_value = *scale;
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    has_task =
+        map_gather_page_task<true>(blockIdx.x, cu_seq_lens, num_reqs,
+                                   num_tokens, block_size, seq_starts, page);
+    copy_task = has_task && page.logical_block < block_table_stride;
+    if (copy_task) {
+      physical_block =
+          block_table[page.req_id * block_table_stride + page.logical_block];
+    }
+  }
+  __syncthreads();
+  if (!has_task || !copy_task) {
+    return;
+  }
+
+  const int32_t num_page_tokens = page.page_token_end - page.page_token_begin;
+  if (vectorizable) {
+    const int32_t page_vectors = num_page_tokens * vec_iter_cnt;
+    for (int32_t flat_idx = threadIdx.x; flat_idx < page_vectors;
+         flat_idx += blockDim.x) {
+      const int32_t token_offset = flat_idx / vec_iter_cnt;
+      const int32_t idx = flat_idx - token_offset * vec_iter_cnt;
+      const int32_t page_token = page.page_token_begin + token_offset;
+      const int32_t output_token = page.output_token_begin + token_offset;
+      const cache_t* src = src_cache + physical_block * cache_block_stride +
+                           page_token * cache_entry_stride;
+      scalar_t* output = dst + output_token * dst_entry_stride;
+
+      if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+        reinterpret_cast<stype*>(output)[idx] =
+            static_cast<stype>(reinterpret_cast<const ltype*>(src)[idx]);
+      } else {
+        const ltype loaded = reinterpret_cast<const ltype*>(src)[idx];
+        stype converted;
+#pragma unroll
+        for (int32_t j = 0; j < vec_size; ++j) {
+          converted.val[j] = fp8::scaled_convert<scalar_t, cache_t, kv_dt>(
+              loaded.val[j], scale_value);
+        }
+        reinterpret_cast<stype*>(output)[idx] = converted;
+      }
+    }
+  } else {
+    const int32_t page_elems = num_page_tokens * entry_size;
+    for (int32_t flat_idx = threadIdx.x; flat_idx < page_elems;
+         flat_idx += blockDim.x) {
+      const int32_t token_offset = flat_idx / entry_size;
+      const int32_t idx = flat_idx - token_offset * entry_size;
+      const int32_t page_token = page.page_token_begin + token_offset;
+      const int32_t output_token = page.output_token_begin + token_offset;
+      const cache_t* src = src_cache + physical_block * cache_block_stride +
+                           page_token * cache_entry_stride;
+      scalar_t* output = dst + output_token * dst_entry_stride;
+
+      if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+        output[idx] = src[idx];
+      } else {
+        output[idx] = fp8::scaled_convert<scalar_t, cache_t, kv_dt>(
+            src[idx], scale_value);
+      }
+    }
+  }
+}
+
 }  // namespace vllm
 
 // Macro to dispatch the kernel based on the data type.
@@ -1346,6 +1449,19 @@ __global__ void gather_and_maybe_dequant_cache_page(
 
 #define CALL_GATHER_CACHE_320(SCALAR_T, CACHE_T, KV_DTYPE) \
   CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE, 320)
+
+#define CALL_GATHER_CACHE_GENERIC(SCALAR_T, CACHE_T, KV_DTYPE)              \
+  vllm::gather_and_maybe_dequant_cache_page_generic<SCALAR_T, CACHE_T,      \
+                                                    KV_DTYPE>               \
+      <<<grid, block, 0, stream>>>(                                         \
+          reinterpret_cast<CACHE_T*>(src_cache.data_ptr()),                 \
+          reinterpret_cast<SCALAR_T*>(dst.data_ptr()),                      \
+          block_table.const_data_ptr<int32_t>(),                            \
+          cu_seq_lens.const_data_ptr<int32_t>(), num_reqs,                  \
+          static_cast<int32_t>(num_tokens), block_size, block_table_stride, \
+          cache_block_stride, cache_entry_stride, dst_entry_stride,         \
+          reinterpret_cast<const float*>(scale.data_ptr()), seq_starts_ptr, \
+          head_dim)
 
 // Gather sequences from the cache into the destination tensor.
 //  - cu_seq_lens contains the cumulative sequence lengths for each batch
@@ -1381,9 +1497,10 @@ void gather_and_maybe_dequant_cache(
         seq_starts.value().scalar_type() == torch::headeronly::ScalarType::Int,
         "seq_starts must be int32");
   }
-  STD_TORCH_CHECK(head_dim == 320 || head_dim == 512 || head_dim == 576,
-                  "gather_and_maybe_dequant_cache only support the head_dim to "
-                  "320 or 512 or 576 for better performance")
+  STD_TORCH_CHECK(head_dim > 0,
+                  "gather_and_maybe_dequant_cache requires a positive "
+                  "head_dim, got ",
+                  head_dim)
 
   STD_TORCH_CHECK(src_cache.device() == dst.device(),
                   "src_cache and dst must be on the same device");
@@ -1421,9 +1538,14 @@ void gather_and_maybe_dequant_cache(
   } else if (head_dim == 512) {
     DISPATCH_BY_KV_CACHE_DTYPE(dst.scalar_type(), kv_cache_dtype,
                                CALL_GATHER_CACHE_512);
-  } else {
+  } else if (head_dim == 320) {
     DISPATCH_BY_KV_CACHE_DTYPE(dst.scalar_type(), kv_cache_dtype,
                                CALL_GATHER_CACHE_320);
+  } else {
+    // Non-DeepSeek-standard MLA cache width: runtime-ENTRY_SIZE path (see
+    // gather_and_maybe_dequant_cache_page_generic above).
+    DISPATCH_BY_KV_CACHE_DTYPE(dst.scalar_type(), kv_cache_dtype,
+                               CALL_GATHER_CACHE_GENERIC);
   }
 }
 

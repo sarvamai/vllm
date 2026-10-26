@@ -23,6 +23,7 @@ from vllm.model_executor.layers.attention.mla_attention import QueryLenSupport
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.triton_mla import (
     TritonMLAImpl,
+    TritonMLAMetadata,
     TritonMLAMetadataBuilder,
 )
 
@@ -213,3 +214,26 @@ def test_causal_multi_token_decode_is_rejected_under_dcp():
 
     # Non-causal rows all take the same extent, which stays correct when local.
     _run_forward_mqa(_seq_lens(4), query_len=4, causal=False, dcp_world_size=2)
+
+
+@pytest.mark.parametrize("head_dim", [160, 192, 224, 256, 288, 416, 320, 512, 576])
+def test_metadata_accepts_non_fused_kernel_widths(head_dim):
+    """MLACommonMetadata.__post_init__ rejects any head_dim outside the fused
+    FlashInfer/Cutlass/FlashMLA kernel sizes {320, 512, 576}, regardless of
+    which backend built it. TritonMLAMetadataBuilder instead builds this
+    TritonMLAMetadata subclass, whose __post_init__ matches TRITON_MLA's
+    actual kernel contract (decode_attention_fwd/forward_mqa index purely off
+    tensor strides, so any positive width works)."""
+    metadata = TritonMLAMetadata(
+        num_reqs=1,
+        max_query_len=1,
+        max_seq_len=1,
+        num_actual_tokens=1,
+        query_start_loc=None,
+        slot_mapping=None,
+        num_decodes=1,
+        num_decode_tokens=1,
+        num_prefills=0,
+        head_dim=head_dim,
+    )
+    assert metadata.head_dim == head_dim
