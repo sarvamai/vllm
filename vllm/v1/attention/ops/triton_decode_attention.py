@@ -30,6 +30,7 @@ It supports page size >= 1.
 
 import logging
 import math
+from functools import cache
 from typing import Any
 
 import torch
@@ -43,6 +44,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.mem_utils import get_max_shared_memory_bytes
 
 is_hip_ = current_platform.is_rocm()
 
@@ -70,6 +72,12 @@ def _page_stride(buf, page_size):
     if buf.ndim == 3:
         buf = buf.unflatten(-3, (-1, page_size))
     return buf.stride(-4)
+
+
+@cache
+def _max_shared_memory_bytes():
+    # Cached since the decode launch runs per layer per step when eager.
+    return get_max_shared_memory_bytes()
 
 
 @triton.jit
@@ -598,6 +606,17 @@ def _decode_grouped_att_m_fwd(
         # Avoid shared memory overflow on NVIDIA when BLOCK_DMODEL is large
         # like non-MLA D_QK=576, BLOCK_DMODEL=1024, BLOCK_H=16
         # exceeds 101376 bytes limit
+        num_stages = 1
+    elif (
+        current_platform.is_cuda()
+        and is_mla
+        and BLOCK_DMODEL >= 512
+        and k_buffer.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        and _max_shared_memory_bytes() < 102400
+    ):
+        # Avoid shared memory overflow on NVIDIA when the KV cache is FP8
+        # like MLA D_QK=576, BLOCK_DMODEL=512, BLOCK_H=16 needs 102400 bytes,
+        # exceeds 101376 bytes limit on e.g. SM120
         num_stages = 1
 
     return grid, dict(
